@@ -1,0 +1,550 @@
+/******************************************************************************************
+
+- 🎯 PUMP.FUN SIMPLE SNIPER v1.1 - OPTIMALIZÁLT FREE RPC-RE
+- 
+- ÚJ:
+- - RPC rotáció (több ingyenes RPC)
+- - Csökkentett priority fee
+- - Kevesebb API hívás
+- - Jobb hibakezelés
+    ******************************************************************************************/
+
+import {
+Connection,
+Keypair,
+PublicKey,
+LAMPORTS_PER_SOL,
+Transaction,
+ComputeBudgetProgram,
+TransactionInstruction,
+SystemProgram,
+} from ‘@solana/web3.js’;
+import {
+getAssociatedTokenAddress,
+createAssociatedTokenAccountInstruction,
+TOKEN_PROGRAM_ID
+} from ‘@solana/spl-token’;
+import bs58 from ‘bs58’;
+import dotenv from ‘dotenv’;
+
+dotenv.config();
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONFIG
+// ═══════════════════════════════════════════════════════════════════════════════
+const CONFIG = {
+BUY_AMOUNT_SOL: 0.002,      // Csökkentve (kevesebb rizikó)
+
+TAKE_PROFIT: 40,            // Növelve (türelmesebb)
+STOP_LOSS: -15,             // Szigorúbb stop
+
+MIN_LIQUIDITY: 1,           // Emelve (biztonságosabb)
+MAX_LIQUIDITY: 30,          // Csökkentve (korábbi entry)
+
+MAX_POSITIONS: 1,           // Csak 1 egyszerre (biztonság)
+CHECK_INTERVAL: 5000,       // 5mp (kevesebb RPC hívás)
+
+PRIORITY_FEE: 50000,        // Csökkentett fee (0.00005 SOL)
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RPC ROTÁCIÓ
+// ═══════════════════════════════════════════════════════════════════════════════
+const RPC_ENDPOINTS = [
+‘https://api.mainnet-beta.solana.com’,
+‘https://solana-api.projectserum.com’,
+‘https://rpc.ankr.com/solana’,
+‘https://solana-mainnet.rpc.extrnode.com’,
+‘https://solana.public-rpc.com’,
+];
+
+let currentRpcIndex = 0;
+let connection: Connection;
+let rpcFailCount = 0;
+
+function getConnection(): Connection {
+if (connection && rpcFailCount < 3) return connection;
+
+// Váltás következő RPC-re
+currentRpcIndex = (currentRpcIndex + 1) % RPC_ENDPOINTS.length;
+const rpc = process.env.RPC_URL || RPC_ENDPOINTS[currentRpcIndex];
+
+log(`🔄 Switching to RPC: ${rpc.slice(0, 40)}...`);
+connection = new Connection(rpc, {
+commitment: ‘confirmed’,
+confirmTransactionInitialTimeout: 60000,
+});
+rpcFailCount = 0;
+
+return connection;
+}
+
+// Retry wrapper RPC hívásokhoz
+async function withRetry<T>(fn: () => Promise<T>, retries = 2): Promise<T> {
+for (let i = 0; i < retries; i++) {
+try {
+return await fn();
+} catch (e: any) {
+rpcFailCount++;
+if (i === retries - 1) throw e;
+log(`⚠️ RPC error, retrying... (${i + 1}/${retries})`);
+await sleep(1000);
+getConnection(); // Próbálj új RPC-t
+}
+}
+throw new Error(‘Max retries reached’);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PUMP.FUN CÍMEK
+// ═══════════════════════════════════════════════════════════════════════════════
+const PUMP_PROGRAM = new PublicKey(‘6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P’);
+const PUMP_GLOBAL = new PublicKey(‘4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf’);
+const PUMP_FEE_RECIPIENT = new PublicKey(‘62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV’);
+const PUMP_EVENT_AUTH = new PublicKey(‘Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1’);
+const PUMP_GLOBAL_VOLUME = new PublicKey(‘Hq2wp8uJ9jCPsYgNHex8RtqdvMPfVGoYwjvF1ATiwn2Y’);
+const PUMP_FEE_CONFIG = new PublicKey(‘8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt’);
+const PFEE_PROGRAM = new PublicKey(‘pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ’);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+interface Position {
+mint: PublicKey;
+buyPrice: number;
+buyTime: number;
+solSpent: number;
+}
+
+const positions: Map<string, Position> = new Map();
+const boughtTokens: Set<string> = new Set();
+const seenSignatures: Set<string> = new Set();
+
+let wallet: Keypair;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UTILS
+// ═══════════════════════════════════════════════════════════════════════════════
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+const log = (msg: string) => console.log(`[${new Date().toLocaleTimeString()}] ${msg}`);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PDA DERIVÁLÁSOK
+// ═══════════════════════════════════════════════════════════════════════════════
+const deriveBondingCurve = (mint: PublicKey) =>
+PublicKey.findProgramAddressSync([Buffer.from(‘bonding-curve’), mint.toBuffer()], PUMP_PROGRAM)[0];
+
+const deriveCreatorVault = (creator: PublicKey) =>
+PublicKey.findProgramAddressSync([Buffer.from(‘creator-vault’), creator.toBuffer()], PUMP_PROGRAM)[0];
+
+const deriveUserVolume = (user: PublicKey) =>
+PublicKey.findProgramAddressSync([Buffer.from(‘user_volume_accumulator’), user.toBuffer()], PUMP_PROGRAM)[0];
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CHAIN LEKÉRDEZÉSEK (optimalizált)
+// ═══════════════════════════════════════════════════════════════════════════════
+async function getCreator(mint: PublicKey): Promise<PublicKey | null> {
+try {
+const bc = deriveBondingCurve(mint);
+const info = await withRetry(() => getConnection().getAccountInfo(bc));
+if (!info || info.data.length < 81) return null;
+return new PublicKey(info.data.slice(49, 81));
+} catch { return null; }
+}
+
+async function getLiquidity(mint: PublicKey): Promise<number> {
+try {
+const bc = deriveBondingCurve(mint);
+const bal = await withRetry(() => getConnection().getBalance(bc));
+return bal / LAMPORTS_PER_SOL;
+} catch { return 0; }
+}
+
+async function getPrice(mint: PublicKey): Promise<number> {
+try {
+const liq = await getLiquidity(mint);
+const supply = (await withRetry(() => getConnection().getTokenSupply(mint))).value.uiAmount ?? 1;
+return liq / supply;
+} catch { return 0; }
+}
+
+async function getTokenBalance(mint: PublicKey): Promise<bigint> {
+try {
+const ata = await getAssociatedTokenAddress(mint, wallet.publicKey);
+const bal = await withRetry(() => getConnection().getTokenAccountBalance(ata));
+return BigInt(bal.value.amount);
+} catch { return BigInt(0); }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SZŰRŐ
+// ═══════════════════════════════════════════════════════════════════════════════
+async function isGoodToken(mint: PublicKey): Promise<{ ok: boolean; reason: string }> {
+if (boughtTokens.has(mint.toBase58())) {
+return { ok: false, reason: ‘already_bought’ };
+}
+
+if (positions.size >= CONFIG.MAX_POSITIONS) {
+return { ok: false, reason: ‘max_positions’ };
+}
+
+const liq = await getLiquidity(mint);
+
+if (liq < CONFIG.MIN_LIQUIDITY) {
+return { ok: false, reason: `low_liq_${liq.toFixed(2)}` };
+}
+
+if (liq > CONFIG.MAX_LIQUIDITY) {
+return { ok: false, reason: `high_liq_${liq.toFixed(2)}` };
+}
+
+return { ok: true, reason: ‘PASS’ };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BUY
+// ═══════════════════════════════════════════════════════════════════════════════
+async function buy(mint: PublicKey): Promise<boolean> {
+try {
+const mintStr = mint.toBase58();
+log(`🔄 BUYING ${mintStr.slice(0, 8)}...`);
+
+```
+const conn = getConnection();
+const mintInfo = await withRetry(() => conn.getAccountInfo(mint));
+const tokenProg = mintInfo?.owner || TOKEN_PROGRAM_ID;
+
+const bc = deriveBondingCurve(mint);
+const creator = await getCreator(mint);
+if (!creator) {
+  log(`❌ No creator found`);
+  return false;
+}
+
+const creatorVault = deriveCreatorVault(creator);
+const bcAta = await getAssociatedTokenAddress(mint, bc, true, tokenProg);
+const userAta = await getAssociatedTokenAddress(mint, wallet.publicKey, false, tokenProg);
+const userVol = deriveUserVolume(wallet.publicKey);
+
+const ixs: TransactionInstruction[] = [];
+
+const ataInfo = await withRetry(() => conn.getAccountInfo(userAta));
+if (!ataInfo) {
+  ixs.push(createAssociatedTokenAccountInstruction(
+    wallet.publicKey, userAta, wallet.publicKey, mint, tokenProg
+  ));
+}
+
+const solLamports = Math.floor(CONFIG.BUY_AMOUNT_SOL * LAMPORTS_PER_SOL);
+const data = Buffer.alloc(24);
+Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]).copy(data, 0);
+data.writeBigUInt64LE(BigInt('18446744073709551615'), 8);
+data.writeBigUInt64LE(BigInt(Math.floor(solLamports * 1.05)), 16);
+
+ixs.push(new TransactionInstruction({
+  programId: PUMP_PROGRAM,
+  keys: [
+    { pubkey: PUMP_GLOBAL, isSigner: false, isWritable: false },
+    { pubkey: PUMP_FEE_RECIPIENT, isSigner: false, isWritable: true },
+    { pubkey: mint, isSigner: false, isWritable: false },
+    { pubkey: bc, isSigner: false, isWritable: true },
+    { pubkey: bcAta, isSigner: false, isWritable: true },
+    { pubkey: userAta, isSigner: false, isWritable: true },
+    { pubkey: wallet.publicKey, isSigner: true, isWritable: true },
+    { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    { pubkey: tokenProg, isSigner: false, isWritable: false },
+    { pubkey: creatorVault, isSigner: false, isWritable: true },
+    { pubkey: PUMP_EVENT_AUTH, isSigner: false, isWritable: false },
+    { pubkey: PUMP_PROGRAM, isSigner: false, isWritable: false },
+    { pubkey: PUMP_GLOBAL_VOLUME, isSigner: false, isWritable: true },
+    { pubkey: userVol, isSigner: false, isWritable: true },
+    { pubkey: PUMP_FEE_CONFIG, isSigner: false, isWritable: false },
+    { pubkey: PFEE_PROGRAM, isSigner: false, isWritable: false },
+  ],
+  data
+}));
+
+const tx = new Transaction()
+  .add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: CONFIG.PRIORITY_FEE }))
+  .add(ComputeBudgetProgram.setComputeUnitLimit({ units: 250000 }))
+  .add(...ixs);
+
+const { blockhash } = await withRetry(() => conn.getLatestBlockhash());
+tx.recentBlockhash = blockhash;
+tx.feePayer = wallet.publicKey;
+
+tx.sign(wallet);
+const sig = await withRetry(() => conn.sendRawTransaction(tx.serialize(), { skipPreflight: true }));
+log(`📤 TX: ${sig}`);
+
+await sleep(5000);
+
+const tokens = await getTokenBalance(mint);
+if (tokens === BigInt(0)) {
+  log(`⚠️ No tokens received`);
+  return false;
+}
+
+const price = await getPrice(mint);
+
+positions.set(mintStr, {
+  mint,
+  buyPrice: price,
+  buyTime: Date.now(),
+  solSpent: CONFIG.BUY_AMOUNT_SOL,
+});
+boughtTokens.add(mintStr);
+
+log(`✅ BOUGHT! Price: ${price.toExponential(2)} | solscan.io/tx/${sig}`);
+return true;
+```
+
+} catch (e: any) {
+log(`❌ Buy error: ${e.message}`);
+return false;
+}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SELL
+// ═══════════════════════════════════════════════════════════════════════════════
+async function sell(mint: PublicKey, reason: string): Promise<boolean> {
+try {
+const mintStr = mint.toBase58();
+log(`🔄 SELLING ${mintStr.slice(0, 8)}... (${reason})`);
+
+```
+const balance = await getTokenBalance(mint);
+if (balance === BigInt(0)) {
+  positions.delete(mintStr);
+  return false;
+}
+
+const conn = getConnection();
+const mintInfo = await withRetry(() => conn.getAccountInfo(mint));
+const tokenProg = mintInfo?.owner || TOKEN_PROGRAM_ID;
+
+const bc = deriveBondingCurve(mint);
+const creator = await getCreator(mint);
+if (!creator) return false;
+
+const creatorVault = deriveCreatorVault(creator);
+const bcAta = await getAssociatedTokenAddress(mint, bc, true, tokenProg);
+const userAta = await getAssociatedTokenAddress(mint, wallet.publicKey, false, tokenProg);
+const userVol = deriveUserVolume(wallet.publicKey);
+
+const data = Buffer.alloc(24);
+Buffer.from([51, 230, 133, 164, 1, 127, 131, 173]).copy(data, 0);
+data.writeBigUInt64LE(balance, 8);
+data.writeBigUInt64LE(BigInt(0), 16);
+
+const ix = new TransactionInstruction({
+  programId: PUMP_PROGRAM,
+  keys: [
+    { pubkey: PUMP_GLOBAL, isSigner: false, isWritable: false },
+    { pubkey: PUMP_FEE_RECIPIENT, isSigner: false, isWritable: true },
+    { pubkey: mint, isSigner: false, isWritable: false },
+    { pubkey: bc, isSigner: false, isWritable: true },
+    { pubkey: bcAta, isSigner: false, isWritable: true },
+    { pubkey: userAta, isSigner: false, isWritable: true },
+    { pubkey: wallet.publicKey, isSigner: true, isWritable: true },
+    { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    { pubkey: tokenProg, isSigner: false, isWritable: false },
+    { pubkey: creatorVault, isSigner: false, isWritable: true },
+    { pubkey: PUMP_EVENT_AUTH, isSigner: false, isWritable: false },
+    { pubkey: PUMP_PROGRAM, isSigner: false, isWritable: false },
+    { pubkey: PUMP_GLOBAL_VOLUME, isSigner: false, isWritable: true },
+    { pubkey: userVol, isSigner: false, isWritable: true },
+    { pubkey: PUMP_FEE_CONFIG, isSigner: false, isWritable: false },
+    { pubkey: PFEE_PROGRAM, isSigner: false, isWritable: false },
+  ],
+  data
+});
+
+const tx = new Transaction()
+  .add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: CONFIG.PRIORITY_FEE }))
+  .add(ComputeBudgetProgram.setComputeUnitLimit({ units: 250000 }))
+  .add(ix);
+
+const { blockhash } = await withRetry(() => conn.getLatestBlockhash());
+tx.recentBlockhash = blockhash;
+tx.feePayer = wallet.publicKey;
+
+tx.sign(wallet);
+const sig = await withRetry(() => conn.sendRawTransaction(tx.serialize(), { skipPreflight: true }));
+
+positions.delete(mintStr);
+
+log(`✅ SOLD! (${reason}) TX: solscan.io/tx/${sig}`);
+return true;
+```
+
+} catch (e: any) {
+log(`❌ Sell error: ${e.message}`);
+return false;
+}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ÚJ TOKEN FIGYELÉS (Optimalizált)
+// ═══════════════════════════════════════════════════════════════════════════════
+async function watchNewTokens() {
+log(‘👀 Watching for new tokens…’);
+
+while (true) {
+try {
+const conn = getConnection();
+const sigs = await withRetry(() => conn.getSignaturesForAddress(PUMP_PROGRAM, { limit: 20 }));
+
+```
+  for (const sigInfo of sigs) {
+    if (seenSignatures.has(sigInfo.signature)) continue;
+    seenSignatures.add(sigInfo.signature);
+
+    const tx = await withRetry(() => conn.getParsedTransaction(sigInfo.signature, {
+      maxSupportedTransactionVersion: 0
+    }));
+
+    if (!tx?.meta?.logMessages) continue;
+
+    const logs = tx.meta.logMessages.join(' ');
+
+    if (!logs.includes('Instruction: Create')) continue;
+
+    let mintStr: string | null = null;
+    for (const acc of tx.transaction.message.accountKeys) {
+      const addr = acc.pubkey.toBase58();
+      if (addr.endsWith('pump')) {
+        mintStr = addr;
+        break;
+      }
+    }
+
+    if (!mintStr) continue;
+
+    const mint = new PublicKey(mintStr);
+    log(`🆕 New token: ${mintStr.slice(0, 12)}...`);
+
+    const { ok, reason } = await isGoodToken(mint);
+
+    if (!ok) {
+      log(`   ❌ Skip: ${reason}`);
+      continue;
+    }
+
+    log(`   ✅ Passed filter, buying...`);
+    await buy(mint);
+
+    await sleep(1000);
+  }
+
+  if (seenSignatures.size > 2000) {
+    const arr = Array.from(seenSignatures);
+    arr.slice(0, 1000).forEach(s => seenSignatures.delete(s));
+  }
+
+} catch (e: any) {
+  log(`⚠️ Watch error: ${e.message}`);
+}
+
+await sleep(3000);
+```
+
+}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POZÍCIÓ FIGYELÉS
+// ═══════════════════════════════════════════════════════════════════════════════
+async function watchPositions() {
+log(‘📊 Watching positions for TP/SL…’);
+
+while (true) {
+try {
+for (const [mintStr, pos] of positions) {
+const currentPrice = await getPrice(pos.mint);
+if (currentPrice === 0) continue;
+
+```
+    const pnl = ((currentPrice - pos.buyPrice) / pos.buyPrice) * 100;
+
+    log(`📍 ${mintStr.slice(0, 8)}... | P/L: ${pnl.toFixed(1)}%`);
+
+    if (pnl >= CONFIG.TAKE_PROFIT) {
+      log(`🎯 TP HIT! +${pnl.toFixed(1)}%`);
+      await sell(pos.mint, `TP +${pnl.toFixed(1)}%`);
+      continue;
+    }
+
+    if (pnl <= CONFIG.STOP_LOSS) {
+      log(`🛑 SL HIT! ${pnl.toFixed(1)}%`);
+      await sell(pos.mint, `SL ${pnl.toFixed(1)}%`);
+      continue;
+    }
+  }
+} catch (e: any) {
+  log(`⚠️ Position watch error: ${e.message}`);
+}
+
+await sleep(CONFIG.CHECK_INTERVAL);
+```
+
+}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STATUS
+// ═══════════════════════════════════════════════════════════════════════════════
+async function showStatus() {
+while (true) {
+await sleep(60000);
+
+```
+const conn = getConnection();
+const bal = await withRetry(() => conn.getBalance(wallet.publicKey)) / LAMPORTS_PER_SOL;
+log(`\n════════════════════════════════`);
+log(`💰 Balance: ${bal.toFixed(4)} SOL`);
+log(`📊 Positions: ${positions.size}/${CONFIG.MAX_POSITIONS}`);
+log(`🔄 Current RPC: ${RPC_ENDPOINTS[currentRpcIndex].slice(0, 30)}...`);
+log(`════════════════════════════════\n`);
+```
+
+}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// START
+// ═══════════════════════════════════════════════════════════════════════════════
+async function main() {
+console.log(’\n═══════════════════════════════════════’);
+console.log(‘🎯 PUMP.FUN SNIPER v1.1 - FREE RPC’);
+console.log(‘═══════════════════════════════════════\n’);
+
+wallet = Keypair.fromSecretKey(bs58.decode(process.env.PRIVATE_KEY!));
+const conn = getConnection();
+
+const balance = await withRetry(() => conn.getBalance(wallet.publicKey)) / LAMPORTS_PER_SOL;
+
+console.log(`👤 Wallet: ${wallet.publicKey.toBase58()}`);
+console.log(`💰 Balance: ${balance.toFixed(4)} SOL`);
+console.log(`\n⚙️ Config:`);
+console.log(`   Buy: ${CONFIG.BUY_AMOUNT_SOL} SOL`);
+console.log(`   TP: +${CONFIG.TAKE_PROFIT}%`);
+console.log(`   SL: ${CONFIG.STOP_LOSS}%`);
+console.log(`   Priority Fee: ${CONFIG.PRIORITY_FEE / 1000000} SOL`);
+console.log(`   Max positions: ${CONFIG.MAX_POSITIONS}`);
+console.log(’\n═══════════════════════════════════════\n’);
+
+if (balance < 0.005) {
+console.error(‘❌ Not enough SOL!’);
+process.exit(1);
+}
+
+watchNewTokens();
+watchPositions();
+showStatus();
+
+log(‘🚀 Bot started!\n’);
+}
+
+main().catch(console.error);
